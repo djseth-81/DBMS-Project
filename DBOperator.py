@@ -1,221 +1,327 @@
-from pprint import pprint
-from sqlite3 import connect
-from json import loads, dumps
+# connector to our database
+import sqlite3
+# custom types for each entity we're manipulating
+from entities import *
 
-class DBOperator():
+class DBOperator:
     """
-    A basic Class that will directly interface with a specified SQL database
+    represents a single database connection, handles
+    connection, cursor, transactions, and crud
     """
 
-    def __init__(self, table='', host='', port='', user='',
-                 passwd='', schema='public', db='demo') -> None:
-        self.table = table
-        self.__host = host
-        self.__port = port
-        self.__user = user
-        self.__passwd = passwd
+    def __init__(self, db_file: str = 'project.db') -> None:
+        # store the path to the database file
+        self.__db_file: str = db_file
+        # initialize connection and cursor placeholders
+        self.__db: Optional[sqlite3.Connection] = None
+        self.__cursor: Optional[sqlite3.Cursor] = None
+        # attempt to connect
+        self._connect()
 
+    def _connect(self) -> None:
+        """establishes the database connection and cursor"""
         try:
-            self.__db = connect(db)
+            # connect to the sqlite database.
+            # TODO: this automatically creates the file if it doesn't exist, but we never want to do that
+            self.__db = sqlite3.connect(self.__db_file)
+            # enable foreign key constraints
+            self.__db.execute("PRAGMA foreign_keys = ON;")
             self.__cursor = self.__db.cursor()
-            print("### DBOperator: Connected to DB")
-            # self.permissions = self.__get_privileges()
-            # self.attrs = self.__get_attributes()
-        except Exception as e:
-            print(f"### DBOperator: Error connecting to database:\n{e}")
+            print(f"info: successfully connected to database '{self.__db_file}'.")
+        except sqlite3.Error as e:
+            # print error if connection fails
+            print(f"error: failed to connect to database '{self.__db_file}': {e}", file=sys.stderr)
+            # ensure resources are cleaned up
+            self.__db = None
+            self.__cursor = None
 
-    ### Mutators ###
-    def add(self, entity: dict) -> None:
+    def is_connected(self) -> bool:
+        return self.__db is not None and self.__cursor is not None
+
+    # mutators
+    def add(self, table: str, entity: Dict[str, Any]) -> Optional[int]:
         """
-        Adds entry to connected table
-        Expects a dict = {key: value} to enter as attribute and value
+        adds a single row to the specified table.
+        returns the row id if successful, otherwise none.
+        requires commit() to save changes permanently.
         """
-        # Format keys as attributes for INSERT INTO cmd
+        if not self.is_connected():
+            print("error: no database connection available.", file=sys.stderr)
+            return None
+        # check for empty data
+        if not entity:
+            print("warning: add operation called with empty entity data.", file=sys.stderr)
+            return None
+
+        # prepare column names and placeholders
         attrs = ','.join(entity.keys())
+        values = list(entity.values())
+        placeholders = ','.join(['?'] * len(values))
 
-        # Define values array for pruning LATER...
-        values = [value for value in entity.values()]
-
-        # Pre-formatting SQL command.
-        #   Add table, formatted attributes string, and the number of %s to add for values
-        cmd = f'''
-            INSERT INTO {self.table} ({attrs})
-            VALUES ({'%s,' * (len(values))})'''
-
-        # NOW we convert values into tuples
-        values = tuple(values)
+        # construct the sql insert statement
+        sql = f"INSERT INTO {table} ({attrs}) VALUES ({placeholders})"
 
         try:
-            self.__cursor.execute(cmd, (values))
-            print("### DBOperator: Entry added to commands queue")
-        except Exception as e:
-            print(f"### DBOperator ERROR: Unable to add entity: {e}")
+            self.__cursor.execute(sql, tuple(values))
+            return self.__cursor.lastrowid
+        except sqlite3.Error as e:
+            print(f"error: failed to queue add operation for table '{table}': {e}", file=sys.stderr)
+            self.rollback()
+            return None
 
-    def modify(self, entity: tuple, data: dict) -> None:
+    def modify(self, table: str, identifier: Tuple[str, Any], data: Dict[str, Any]) -> bool:
         """
-        Modifys a singular exisitng entity
+        modifies existing rows in a table based on an identifier.
+        returns true if the command was queued successfully, false otherwise.
+        note: requires commit() to save changes permanently.
+
+        :param table: the name of the table to update.
+        :param identifier: a tuple (column_name, value) to identify the row(s) to update.
+        :param data: a dictionary {column_to_update: new_value}.
         """
-        # Disgusting
-        cmd = f"UPDATE {self.table} SET "
-        for i, (key, val) in enumerate(data.items()):
-            cmd += f"{key} = {val}" if type(val) != str else f"{key} = '{val}'"
-            if i < (len(data.items()) - 1):
-                cmd += ","
+        if not self.is_connected():
+            print("error: no database connection available.", file=sys.stderr)
+            return False
+        # check for empty update data
+        if not data:
+            print("warning: modify operation called with no data to update.", file=sys.stderr)
+            return False
 
-        self.__cursor.execute(cmd + f" WHERE {entity[0]} = %s", (entity[1],))
-
-    def delete(self, entity: dict) -> None:
-        """
-        deletes entry that has matching attributes ONLY.
-        """
-        # NOTE: NO indication that delete is called on non-existent values.
-        # Assumes value exists, and just deletes nothing
-
-        if len(entity) == 0:
-            raise AttributeError(
-                "### DBOperator: Error. Provided entity is empty.")
-
-        print(f"### DBOperator: Deleting {entity}")
-
-        conditions = []
+        # prepare set clauses and values
+        set_clauses = []
         values = []
+        for key, val in data.items():
+            set_clauses.append(f"{key} = ?")
+            values.append(val)
 
-        for attr, value in entity.items():
-            conditions.append(f"{attr} = %s")
+        # should not happen if data is not empty, but check anyway
+        if not set_clauses:
+            return False
+
+        # add the identifier value for the where clause
+        values.append(identifier[1])
+        where_clause = f"{identifier[0]} = ?"
+
+        # construct the sql update statement
+        sql = f"UPDATE {table} SET {', '.join(set_clauses)} WHERE {where_clause}"
+
+        try:
+            self.__cursor.execute(sql, tuple(values))
+            print(f"info: modify request for table '{table}' queued.")
+            return True
+        except sqlite3.Error as e:
+            print(f"error: failed to queue modify operation for table '{table}': {e}", file=sys.stderr)
+            self.rollback()
+            return False
+
+    def delete(self, table: str, conditions: Dict[str, Any]) -> bool:
+        """
+        deletes rows from a table based on specified conditions.
+        returns true if the command was queued successfully, false otherwise.
+        note: requires commit() to save changes permanently.
+
+        :param table: the name of the table.
+        :param conditions: a dictionary {column_name: value} for the where clause.
+        """
+        if not self.is_connected():
+            print("error: no database connection available.", file=sys.stderr)
+            return False
+        # prevent accidental full table delete
+        if not conditions:
+            print("error: delete operation requires conditions. use clear() to delete all rows.", file=sys.stderr)
+            return False
+
+        print(f"info: preparing to delete from '{table}' where {conditions}")
+
+        # prepare where clauses and values
+        where_clauses = []
+        values = []
+        for attr, value in conditions.items():
+            where_clauses.append(f"{attr} = ?")
             values.append(value)
 
-        if not conditions:
+        # construct the sql delete statement
+        sql = f"DELETE FROM {table} WHERE {' AND '.join(where_clauses)}"
+
+        try:
+            self.__cursor.execute(sql, tuple(values))
+            return True
+        except sqlite3.Error as e:
+            print(f"error: failed to queue delete operation for table '{table}': {e}", file=sys.stderr)
+            self.rollback()
+            return False
+
+    def clear(self, table: str) -> bool:
+        """
+        removes all entries from the specified table. use with extreme caution!
+        returns true if the command was queued successfully, false otherwise.
+        note: requires commit() to save changes permanently.
+        """
+        if not self.is_connected():
+            print("error: no database connection available.", file=sys.stderr)
+            return False
+        try:
+            # execute the delete command without a where clause
+            self.__cursor.execute(f"DELETE FROM {table}")
+            print(f"warning: clear request for table '{table}' queued. this will delete all rows upon commit.")
+            return True
+        except sqlite3.Error as e:
+            # print error and rollback transaction on failure
+            print(f"error: failed to queue clear operation for table '{table}': {e}", file=sys.stderr)
+            self.rollback()
+            return False
+
+    # transaction management
+    def commit(self) -> None:
+        """commits the current transaction to the database."""
+        if not self.is_connected():
+            print("error: no database connection available to commit.", file=sys.stderr)
+            return
+        try:
+            self.__db.commit()
+            print("info: transaction committed successfully.")
+        except sqlite3.Error as e:
+            print(f"error: failed to commit transaction: {e}", file=sys.stderr)
+
+    def rollback(self) -> None:
+        """rolls back the current transaction, discarding changes since the last commit."""
+        if not self.is_connected():
+            print("info: rollback called but no active connection or transaction.")
+            return
+        try:
+            self.__db.rollback()
+            print("info: transaction rolled back.")
+        except sqlite3.Error as e:
+            print(f"error: failed to rollback transaction: {e}", file=sys.stderr)
+
+    # connection management
+    def close(self) -> None:
+        """
+        closes the database connection gracefully.
+        """
+        # rollback any pending changes before closing
+        self.rollback()
+        if self.__cursor:
+            try:
+                self.__cursor.close()
+            except sqlite3.Error as e:
+                print(f"warning: error closing cursor: {e}", file=sys.stderr)
+            self.__cursor = None
+        if self.__db:
+            try:
+                self.__db.close()
+                print(f"info: connection to database '{self.__db_file}' closed.")
+            except sqlite3.Error as e:
+                print(f"warning: error closing database connection: {e}", file=sys.stderr)
+            self.__db = None
+
+    # accessors
+    def query(self, table: str, conditions: Dict[str, Any] = None) -> List[Dict[str, Any]]:
+        """
+        queries rows from a table based on specified conditions.
+        returns a list of dictionaries, where each dictionary represents a row.
+        if conditions is none or empty, returns all rows (like get_table).
+        """
+        if not self.is_connected():
+            print("error: no database connection available.", file=sys.stderr)
             return []
 
-        query = f"""
-            DELETE FROM ONLY {self.table}
-            WHERE {' AND '.join(conditions)}
-        """
-        try:
-            self.__cursor.execute(query, tuple(values))
-            print("### DBOperator: Deletion reqeust added to queue.")
-        except Exception as e:
-            print(f"{e}\n### DBOperator: Error deleting item.")
-            self.rollback()  # Uhm... Why are you necessary so other commands don't break?
+        params = tuple()
+        sql = f"SELECT * FROM {table}"
 
-    def clear(self) -> tuple:
-        """
-        Clears all entries from table
-        """
-        self.__cursor.execute(f"DELETE FROM {self.table}")
-        return ("message", "table cleared.")
-
-    # commit command
-    def commit(self) -> tuple:
-        self.__db.commit()
-        print("### DBOperator: Commands submitted.")
-        return ("message", "Committed.")
-
-    # rollback command
-    def rollback(self) -> tuple:
-        self.__db.rollback()
-        print("### DBOperator: Dumped cursor commands.")
-        return ("message", "Rollback executed.")
-
-    def close(self) -> tuple:
-        """
-        Closes table connection
-        """
-        self.__cursor.close()
-        self.__db.close()
-        print("### DBOperator: Connection closed.")
-        return ("message", "DB instance closed.")
-
-    ### Accessors ###
-    def __get_attributes(self) -> dict:
-        """
-        Fetches table attributes
-        """
-        pass
-
-    # Fetching tables in DB --> Dev option!
-    def __get_tables(self) -> list:
-        """
-        Fetching tables in DB
-        """
-        pass
-
-    def __get_privileges(self) -> dict:
-        """
-        Lists the privileges assigned to user per a given operation
-        """
-        pass
-
-    # pull data from DB
-    def query(self, queries: list) -> list:
-        """
-        Querys entities based on a dictionary of provided filters
-        returns list of dictionary types
-        """
-        # NOTE: NO indication for query on non-existent values.
-        # Assume value exists and just returns an empty array.
-        cmd = []
-        values = []
-
-        if len(queries) == 0:
-            raise AttributeError(
-                "### DBOperator: Cannot query an empty array...")
-
-        for entity in queries:
-            if len(entity) == 0:
-                raise AttributeError(
-                    "### DBOperator: Cannot query an empty dictionary...")
-            conditions = []
-            for attr, value in entity.items():
-                conditions.append(f"{attr} = %s")
+        # add where clause if conditions are provided
+        if conditions:
+            where_clauses = []
+            values = []
+            for attr, value in conditions.items():
+                # handle 'like' queries if value contains '%'
+                if isinstance(value, str) and '%' in value:
+                     where_clauses.append(f"{attr} LIKE ?")
+                else:
+                     where_clauses.append(f"{attr} = ?")
                 values.append(value)
 
-            if not conditions:
-                return []
-
-            cmd.append(f"""
-                SELECT *
-                FROM {self.table}
-                WHERE {' AND '.join(conditions)}
-            """)
+            if where_clauses:
+                sql += f" WHERE {' AND '.join(where_clauses)}"
+                params = tuple(values)
+            else:
+                # none of the incoming conditions resulted in clauses...
+                pass
 
         try:
-            self.__cursor.execute(
-                f"SELECT row_to_json(data) FROM ({' UNION '.join(cmd)}) data", tuple(values))
-            results = [i[0] for i in self.__cursor.fetchall()]
+            self.__cursor.execute(sql, params)
+            # get table details from cursor description
+            if self.__cursor.description:
+                # get column names from cursor description
+                columns = [description[0] for description in self.__cursor.description]
+                # fetch all rows and format them as dictionaries
+                return [dict(zip(columns, row)) for row in self.__cursor.fetchall()]
+            else:
+                # query did not return results
+                return []
+        except sqlite3.Error as e:
+            print(f"error: failed to execute query on table '{table}': {e}", file=sys.stderr)
+            return []
 
-            return results
-        except Exception as e:
-            print(f"### DBOperator: Error occured:\n{e}")
+    def get_table(self, table: str) -> List[Dict[str, Any]]:
+        # shorthand for query base case
+        return self.query(table=table, conditions=None)
 
-    def get_table(self) -> list:
+    def get_count(self, table: str) -> int:
         """
-        Returns all entries in a table as a list of dictionary datatypes
+        returns the total number of rows in the specified table or -1 on error
         """
-        self.__cursor.execute(
-            f"select row_to_json(data) FROM (SELECT * FROM {self.table}) data")
+        # check for active connection
+        if not self.is_connected():
+            print("error: no database connection available.", file=sys.stderr)
+            return -1
+        try:
+            self.__cursor.execute(f"SELECT COUNT(*) FROM {table}")
+            result = self.__cursor.fetchone()
+            return result[0] if result else 0
+        except sqlite3.Error as e:
+            print(f"error: failed to get count for table '{table}': {e}", file=sys.stderr)
+            return -1
 
-        results = [i[0] for i in self.__cursor.fetchall()]
-
-        return results
-
-    def get_count(self) -> int:
+    # raw sql execution
+    def execute_raw_sql(self, sql: str) -> Union[List[Dict[str, Any]], int, None]:
         """
-        Returns count of entries in table
+        executes an arbitrary sql statement.
+        for select queries, returns a list of dictionaries.
+        for insert/update/delete, returns the number of affected rows after commit.
+        for other sql commands (create, drop, etc.), returns none after commit.
+        automatically handles commit/rollback for non-select statements.
+
+        :param sql: the sql statement to execute.
+        :param params: optional tuple of parameters for placeholder substitution.
+        :return: query results, row count, or none depending on the sql type.
         """
-        # Idea is for this to be faster and more efficeint than pulling the whole table and counting it
-        self.__cursor.execute(f"SELECT Count(*) FROM {self.table}")
-        return self.__cursor.fetchone()[0]
+        if not self.is_connected():
+            print("error: no database connection available.", file=sys.stderr)
+            return None
 
-if __name__ == "__main__":
+        sql_command = sql.strip().upper()
+        is_select = sql_command.startswith("SELECT") or sql_command.startswith("PRAGMA")
 
-    operator = DBOperator(db='project')  # For me :)
+        try:
+            self.__cursor.execute(sql)
 
-    # operator = DBOperator(db='project', host='localhost', port='5432',
-    #                       user='postgres', passwd='1234', schema='public',
-    #                       db='capstone')
+            if is_select:
+                # fetch results for select queries
+                if self.__cursor.description:
+                    columns = [description[0] for description in self.__cursor.description]
+                    return [dict(zip(columns, row)) for row in self.__cursor.fetchall()]
+                else:
+                    return []
+            else:
+                # for non-select, commit the change and return affected row count
+                rowcount = self.__cursor.rowcount
+                self.commit()
+                print(f"info: raw sql executed successfully. affected rows: {rowcount}")
+                return rowcount
 
-    print(operator.permissions)
-    print(operator.attrs)
-
-    operator.close()
+        except sqlite3.Error as e:
+            print(f"error: failed to execute raw sql: {e}", file=sys.stderr)
+            if not is_select:
+                self.rollback()
+            return None
