@@ -13,7 +13,8 @@ def display_menu():
     print("2. Add New Course (INSERT)")
     print("3. Delete Enrollment Record (DELETE)")
     print("4. View a course's syllabus (JOIN)")
-    print("5. SQL Console")
+    print("5. View a student's gradebook (NESTED QUERY)")
+    print("6. SQL Console")
     print("0. Exit")
     print("-------------------------------")
 
@@ -168,7 +169,7 @@ def handle_delete_enrollment(operator: DBOperator, student_id_str=None, course_i
 
 
 def handle_sql_console(operator: DBOperator):
-    """handles option 5: execute raw sql commands."""
+    """handles option 6: execute raw sql commands."""
     if not operator.is_connected():
         print("error: cannot open console, not connected to database.", file=sys.stderr)
         return
@@ -254,6 +255,72 @@ def handle_course_syllabus(operator: DBOperator, course_code=None, year=None):
     except Exception as e:
         print(f"an error occurred searching for course: {e}", file=sys.stderr)
 
+def handle_gradebook(operator, name=None, course=None):
+    """ Handles option 5: Displays a student's gradebook for a given class """
+    if not operator.is_connected():
+        print("error: cannot perform delete, not connected to database.",
+              file=sys.stderr)
+        return
+
+    if name is None:
+        name = input("Enter Student name: ")
+
+    try:
+        command = f"""
+        SELECT *
+        FROM student
+        WHERE person_id in (
+            SELECT person_id
+            FROM person
+            WHERE person.name like '{name}%'
+        )
+        """
+        if (len(operator.execute_raw_sql(sql=command))) < 1:
+            print("Name provided is not a recognzied student", file=sys.stderr)
+
+    except Exception as e:
+        print(f"an error occurred searching for student: {e}", file=sys.stderr)
+
+    if course is None:
+        course = input("Enter course code: ")
+
+    try:
+
+        existing = operator.query(
+            table='course', conditions={'code': course})
+
+        if not existing:
+            print(f"{course} is not offered.")
+            return
+
+        command = f"""
+        SELECT c.code, e.year, a.title, g.grade_value
+        FROM enrollment e
+
+        JOIN course c ON e.course_id = c.course_id
+        JOIN assignment a ON e.course_id = a.course_id
+        JOIN grade g ON a.assignment_id = g.assignment_id
+
+        WHERE e.student_id in (
+            SELECT person_id
+            FROM person
+            WHERE person.name LIKE '{name}%'
+        )
+
+        AND c.code LIKE '{course}'
+        AND e.status = 'ENROLLED'
+
+        ORDER BY e.year
+        """
+        results = operator.execute_raw_sql(sql=command)
+        if len(results) > 0:
+            print(f"{name}'s gradebook for {course}")
+            pprint(results, indent=2)
+        else:
+            print(f"No {course} gradebook for {name}. They might not be enrolled in it.") 
+
+    except Exception as e:
+        print(f"an error occurred searching for course: {e}", file=sys.stderr)
 
 if __name__ == "__main__":
     # specify the database file
@@ -278,7 +345,7 @@ if __name__ == "__main__":
         else:
             while True:
                 display_menu()
-                choice = input("enter your choice (1-5, 0 to Exit): ")
+                choice = input("enter your choice (1-6 or 0 to Exit): ")
 
                 if choice == '1':
                     handle_select_person(operator)
@@ -289,12 +356,14 @@ if __name__ == "__main__":
                 elif choice == '4':
                     handle_course_syllabus(operator)
                 elif choice == '5':
+                    handle_gradebook(operator)
+                elif choice == '6':
                     handle_sql_console(operator)
                 elif choice == '0':
                     print("exiting program.")
                     break
                 else:
-                    print("invalid choice. please enter a number between 1 and 5.")
+                    print("invalid choice. please enter a number between 1 and 6, or 0 to exit.")
 
         operator.close()
     else:
