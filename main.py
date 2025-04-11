@@ -340,6 +340,8 @@ if __name__ == "__main__":
                                      credits_str="3", dept_id_str="1", description="Basic CS course")
                 handle_delete_enrollment(
                     operator, student_id_str="11", course_id_str="6", section="A", semester="Spring", year_str="2024")
+                handle_course_syllabus(operator, course_code="CS201", year="2024")
+                handle_gradebook(operator, name="Charlie Black", course="CS201")
                 sys.stdout = sys.__stdout__
             print("auto mode completed. output saved to test_output.txt.")
         else:
