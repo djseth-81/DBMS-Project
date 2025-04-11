@@ -1,3 +1,4 @@
+import sys
 # connector to our database
 import sqlite3
 # custom types for each entity we're manipulating
